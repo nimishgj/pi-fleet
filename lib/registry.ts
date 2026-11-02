@@ -13,7 +13,10 @@ export const SOCKETS_DIR = join(COMS, "sockets");
 export const FLEET_DIR = join(homedir(), ".pi", "fleet");
 export const TODO_FILE = join(FLEET_DIR, "todo.md");
 
-export type Status = "idle" | "working" | "waiting" | "error" | "starting";
+export type Status = "idle" | "working" | "waiting" | "approval" | "error" | "starting";
+
+/** A safety-guard prompt waiting for a human. */
+export type Approval = { id: string; action: string; command?: string; reason?: string; severity: string; since: number };
 
 export type AgentRecord = {
   id: string;
@@ -30,6 +33,7 @@ export type AgentRecord = {
   statusMsg?: string;
   task?: string; // first user prompt, trimmed
   lastTool?: string;
+  approvals?: Approval[];
   lastActivity: number;
   startedAt: number;
 };
@@ -116,7 +120,8 @@ export function uniqueId(name: string): string {
 export type Request =
   | { op: "info" }
   | { op: "ask"; question: string; timeoutMs?: number }
-  | { op: "send"; message: string };
+  | { op: "send"; message: string }
+  | { op: "approve"; allow: boolean; approvalId?: string };
 
 export function request(sock: string, req: Request, timeoutMs = 15_000): Promise<any> {
   return new Promise((resolve, reject) => {

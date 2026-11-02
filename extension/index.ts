@@ -12,6 +12,7 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import {
   type AgentRecord,
+  type Approval,
   type Status,
   ensureDirs,
   findAgent,
@@ -55,9 +56,10 @@ function textOf(content: any): string {
 
 function osc(status: Status, msg?: string) {
   if (!process.env.REX_BLOCK || !process.stdout.isTTY) return;
-  const state = { idle: "idle", working: "working", waiting: "blocked", error: "error", starting: "working" }[status];
+  const state = { idle: "idle", working: "working", waiting: "blocked", approval: "blocked", error: "error", starting: "working" }[status];
   let body = `state=${state}:app=pi`;
   if (status === "waiting") body += ":kind=question";
+  if (status === "approval") body += ":kind=permission";
   if (msg) {
     const clean = msg.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").slice(0, 200);
     body += `:msg=${Buffer.from(clean, "utf8").toString("base64")}`;
@@ -72,6 +74,9 @@ export default function fleet(pi: ExtensionAPI) {
   let heartbeat: NodeJS.Timeout | undefined;
   let pending: Pending[] = [];
   let ctxRef: ExtensionContext | undefined;
+  // safety-guard prompts waiting for a human, keyed by approval id
+  const approvals = new Map<string, Approval & { decide: (allow: boolean) => void }>();
+  const publicApprovals = (): Approval[] => [...approvals.values()].map(({ decide, ...a }) => a);
 
   const save = (patch: Partial<AgentRecord>) => {
     if (!rec) return;
@@ -111,6 +116,13 @@ export default function fleet(pi: ExtensionAPI) {
           const req = JSON.parse(line);
           if (req.op === "info") return reply({ ok: true, result: rec });
           if (req.op === "ask") return reply({ ok: true, result: await askLive(String(req.question), req.timeoutMs) });
+          if (req.op === "approve") {
+            // Human decision from the fleet home screen or `fleet approve`.
+            const a = req.approvalId ? approvals.get(req.approvalId) : [...approvals.values()][0];
+            if (!a) return reply({ ok: false, error: "nothing waiting for approval" });
+            a.decide(req.allow === true);
+            return reply({ ok: true, result: { id: a.id, allow: req.allow === true, command: a.command ?? a.action } });
+          }
           if (req.op === "send") {
             deliver(`${SEND_MARKER}:\n\n${req.message}`);
             return reply({ ok: true, result: "delivered" });
@@ -126,7 +138,7 @@ export default function fleet(pi: ExtensionAPI) {
   }
 
   function deliver(text: string) {
-    if (rec?.status === "working") pi.sendUserMessage(text, { deliverAs: "followUp" });
+    if (rec?.status === "working" || rec?.status === "approval") pi.sendUserMessage(text, { deliverAs: "followUp" });
     else pi.sendUserMessage(text);
   }
 
@@ -150,6 +162,29 @@ export default function fleet(pi: ExtensionAPI) {
       deliver(text);
     });
   }
+
+  // ── safety-guard approvals ─────────────────────────────────────────────
+  pi.events.on("fleet:approval_request", (req: any) => {
+    if (!req?.id || typeof req.decide !== "function") return;
+    approvals.set(req.id, {
+      id: String(req.id),
+      action: String(req.action ?? "action"),
+      command: req.command ? String(req.command) : undefined,
+      reason: req.reason ? String(req.reason) : undefined,
+      severity: String(req.severity ?? "risky"),
+      since: Date.now(),
+      decide: req.decide,
+    });
+    save({ approvals: publicApprovals() });
+    setStatus("approval", `approve? ${req.command ?? req.action}`.slice(0, 160));
+  });
+  pi.events.on("fleet:approval_done", (e: any) => {
+    if (!approvals.delete(e?.id)) return;
+    save({ approvals: publicApprovals() });
+    const next = [...approvals.values()][0];
+    if (next) setStatus("approval", `approve? ${next.command ?? next.action}`.slice(0, 160));
+    else setStatus("working", rec?.lastTool);
+  });
 
   // ── lifecycle ──────────────────────────────────────────────────────────
   pi.on("session_start", async (_e, ctx) => {
@@ -266,11 +301,11 @@ export default function fleet(pi: ExtensionAPI) {
       try {
         const others = listAgents().filter((a) => a.id !== rec?.id);
         const th = ctx.ui.theme;
-        const color = (s: Status) => ({ working: "success", waiting: "warning", error: "error", idle: "dim", starting: "dim" } as const)[s];
+        const color = (s: Status) => ({ working: "success", waiting: "warning", approval: "warning", error: "error", idle: "dim", starting: "dim" } as const)[s];
         const lines = others.map((a) => {
           const g = th.fg(color(a.status), glyph(a.status));
           const where = a.host === hostname() ? "" : th.fg("accent", ` @${a.host}`);
-          const what = a.status === "waiting" || a.status === "error" ? a.statusMsg ?? "" : a.lastTool ?? a.task ?? "";
+          const what = a.status === "waiting" || a.status === "error" || a.status === "approval" ? a.statusMsg ?? "" : a.lastTool ?? a.task ?? "";
           return `${g} ${a.id.padEnd(14)}${where} ${th.fg("dim", what.slice(0, 70))}`;
         });
         ctx.ui.setWidget("fleet", lines.length ? [th.fg("accent", "fleet"), ...lines] : [th.fg("dim", "fleet: no other agents running")]);
@@ -295,7 +330,7 @@ export default function fleet(pi: ExtensionAPI) {
       if (!all.length) return ok("No other agents are running.");
       const rows = all.map(
         (a) =>
-          `- ${a.id} [${a.status}] host=${a.host} repo=${a.repo} branch=${a.branch} cwd=${a.cwd}\n  task: ${a.task ?? "-"}\n  last: ${a.lastTool ?? "-"}${a.statusMsg ? `\n  note: ${a.statusMsg}` : ""}`,
+          `- ${a.id} [${a.status}] host=${a.host} repo=${a.repo} branch=${a.branch} cwd=${a.cwd}\n  task: ${a.task ?? "-"}\n  last: ${a.lastTool ?? "-"}${a.statusMsg ? `\n  note: ${a.statusMsg}` : ""}${(a.approvals ?? []).map((p) => `\n  WAITING FOR HUMAN APPROVAL: ${p.command ?? p.action} (${p.severity}${p.reason ? `: ${p.reason}` : ""})`).join("")}`,
       );
       return ok(rows.join("\n"), { agents: all });
     },
@@ -386,10 +421,11 @@ export default function fleet(pi: ExtensionAPI) {
       `- "What is everyone doing?" → fleet_list, then fleet_read id='*', and report per agent: doing now / tried / next. Lead with agents that need the user (waiting, error).\n` +
       `- Only use fleet_ask when the user asks to check live or ask the agent directly.\n` +
       `- To start work, use fleet_spawn (use a worktree when another agent already works in that repo).\n` +
-      `- To let the user talk to an agent, use fleet_attach.`,
+      `- To let the user talk to an agent, use fleet_attach.\n` +
+      `- Safety approvals (status "approval") can only be answered by the human: tell them to press y/n on that agent in the fleet home tab, or run \`fleet approve <id>\` / \`fleet deny <id>\`. You have no way to approve, and must never try to work around a safety-guard prompt.`,
   }));
 }
 
 function glyph(s: Status): string {
-  return { working: "●", waiting: "◐", idle: "○", error: "✖", starting: "◌" }[s];
+  return { working: "●", waiting: "◐", approval: "⚠", idle: "○", error: "✖", starting: "◌" }[s];
 }

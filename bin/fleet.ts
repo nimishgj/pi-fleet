@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // fleet — manage pi agents in Rex.
 import { execFileSync, spawnSync } from "node:child_process";
+import { createInterface } from "node:readline/promises";
 import { findAgent, listAgents, readTranscript, request } from "../lib/registry.ts";
 import { attach, spawn, toggleK9s, up } from "../lib/rex.ts";
 import { runHome } from "../lib/home.ts";
@@ -19,11 +20,13 @@ const USAGE = `fleet — pi agents in Rex
   fleet read ID [N]                 print an agent's recent conversation
   fleet ask ID QUESTION             ask an agent live and wait for its answer
   fleet send ID MESSAGE             send an agent an instruction
+  fleet pending                     list safety-guard prompts waiting for you
+  fleet approve ID | fleet deny ID  answer an agent's oldest pending prompt (interactive only)
   fleet k9s [CONTEXT]               toggle a k9s pane in the current tab
   fleet diff                        live, auto-refreshing git diff (used by --diff)
 `;
 
-const GLYPH: Record<string, string> = { working: "●", waiting: "◐", idle: "○", error: "✖", starting: "◌" };
+const GLYPH: Record<string, string> = { working: "●", waiting: "◐", approval: "⚠", idle: "○", error: "✖", starting: "◌" };
 
 async function main(argv: string[]) {
   const [cmd, ...args] = argv;
@@ -82,6 +85,28 @@ async function main(argv: string[]) {
       if (!a) throw new Error(`no agent ${args[0]}`);
       await request(a.socket, { op: "send", message: need(args.slice(1).join(" "), "MESSAGE") });
       return console.log(`sent to ${a.id}`);
+    }
+    case "pending": {
+      const rows = listAgents().flatMap((a) => (a.approvals ?? []).map((p) => ({ a, p })));
+      if (!rows.length) return console.log("nothing waiting for approval");
+      for (const { a, p } of rows) console.log(`⚠ ${a.id.padEnd(16)} ${p.severity.padEnd(12)} ${p.command ?? p.action}${p.reason ? `\n  ${p.reason}` : ""}`);
+      return;
+    }
+    case "approve":
+    case "deny": {
+      // Human-only: agents run tools without a TTY, so they cannot get past this.
+      if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error(`${cmd} must be run by a person in an interactive terminal`);
+      const a = findAgent(need(args[0], "ID"));
+      if (!a) throw new Error(`no agent ${args[0]}`);
+      const p = a.approvals?.[0];
+      if (!p) return console.log(`${a.id}: nothing waiting for approval`);
+      console.log(`${a.id} wants to run (${p.severity}):\n  ${p.command ?? p.action}${p.reason ? `\n  ${p.reason}` : ""}`);
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const ans = (await rl.question(`${cmd === "approve" ? "Allow" : "Block"} it? type yes: `)).trim().toLowerCase();
+      rl.close();
+      if (ans !== "yes") return console.log("cancelled");
+      await request(a.socket, { op: "approve", allow: cmd === "approve", approvalId: p.id });
+      return console.log(`${cmd === "approve" ? "allowed" : "blocked"} on ${a.id}`);
     }
     case "k9s": {
       const s = process.env.REX_SESSION, b = process.env.REX_BLOCK;

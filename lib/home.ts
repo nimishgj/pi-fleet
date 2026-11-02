@@ -2,7 +2,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, join } from "node:path";
-import { type AgentRecord, ensureDirs, listAgents, TODO_FILE, FLEET_DIR } from "./registry.ts";
+import { type AgentRecord, ensureDirs, listAgents, request, TODO_FILE, FLEET_DIR } from "./registry.ts";
 import { attach, spawn } from "./rex.ts";
 
 type Todo = { done: boolean; text: string; pi?: string };
@@ -14,9 +14,9 @@ const c = {
   inv: (s: string) => `${E}7m${s}${E}27m`,
   fg: (n: number, s: string) => `${E}38;5;${n}m${s}${E}39m`,
 };
-const COL = { working: 114, waiting: 179, idle: 244, error: 204, starting: 244, accent: 111, host: 141, link: 81 } as const;
-const GLYPH: Record<string, string> = { working: "●", waiting: "◐", idle: "○", error: "✖", starting: "◌" };
-const STATE: Record<string, string> = { working: "working", waiting: "needs you", idle: "idle", error: "error", starting: "starting" };
+const COL = { working: 114, waiting: 179, approval: 209, idle: 244, error: 204, starting: 244, accent: 111, host: 141, link: 81 } as const;
+const GLYPH: Record<string, string> = { working: "●", waiting: "◐", approval: "⚠", idle: "○", error: "✖", starting: "◌" };
+const STATE: Record<string, string> = { working: "working", waiting: "needs you", approval: "approve?", idle: "idle", error: "error", starting: "starting" };
 const STATE_FILE = join(FLEET_DIR, "home.json");
 
 const fit = (s: string, n: number) => (n <= 0 ? "" : s.length > n ? s.slice(0, Math.max(0, n - 1)) + "…" : s + " ".repeat(n - s.length));
@@ -111,19 +111,28 @@ export function runHome() {
     agents.forEach((a, i) => {
       const on = focus === "agents" && sel.agents === i;
       const host = a.host === hostname() ? "local" : a.host;
-      const doing = a.status === "waiting" || a.status === "error" ? a.statusMsg ?? "" : a.lastTool ?? a.task ?? "";
+      const doing = a.status === "waiting" || a.status === "error" ? a.statusMsg ?? "" : a.status === "approval" ? "" : a.lastTool ?? a.task ?? "";
       const plain = ` ${GLYPH[a.status]} ${fit(a.id, cw.id)}${fit(STATE[a.status], cw.st)}${fit(host, cw.host)}${fit(`${a.repo}:${a.branch}`, cw.repo)}${fit(doing.replace(/\s+/g, " "), lastW)}`;
-      if (on) return aBody.push(c.inv(fit(plain, inner)));
       const sc = COL[a.status];
-      aBody.push(
-        ` ${c.fg(sc, GLYPH[a.status])} ${a.role === "master" ? c.fg(COL.accent, fit(a.id, cw.id)) : fit(a.id, cw.id)}${c.fg(sc, fit(STATE[a.status], cw.st))}${c.fg(COL.host, fit(host, cw.host))}${fit(`${a.repo}:${a.branch}`, cw.repo)}${c.dim(fit(doing.replace(/\s+/g, " "), lastW))}`,
-      );
+      if (on) aBody.push(c.inv(fit(plain, inner)));
+      else
+        aBody.push(
+          ` ${c.fg(sc, GLYPH[a.status])} ${a.role === "master" ? c.fg(COL.accent, fit(a.id, cw.id)) : fit(a.id, cw.id)}${c.fg(sc, fit(STATE[a.status], cw.st))}${c.fg(COL.host, fit(host, cw.host))}${fit(`${a.repo}:${a.branch}`, cw.repo)}${c.dim(fit(doing.replace(/\s+/g, " "), lastW))}`,
+        );
+      // Pending safety-guard approvals, one line each, under the agent.
+      for (const p of a.approvals ?? []) {
+        const what = `${p.severity === "destructive" ? "DESTRUCTIVE " : ""}${p.command ?? p.action}`.replace(/\s+/g, " ");
+        const hint = on ? "  y allow · n block" : "";
+        aBody.push(c.fg(COL.approval, fit(`     ⚠ ${fit(what, inner - 8 - hint.length)}${hint}`, inner)));
+        if (on && p.reason) aBody.push(c.dim(fit(`       ${p.reason}`, inner)));
+      }
     });
     if (!agents.length) aBody.push(c.dim(fit("   no pi agents running — press n to start one", inner)));
     while (aBody.length < aH - 3) aBody.push(" ".repeat(inner));
-    aBody[aH - 3] = c.dim(fit("  enter attach · n new pi · m master · r refresh · q quit", inner));
+    aBody[aH - 3] = c.dim(fit("  enter attach · y/n approve · p next approval · n new pi · m master · r refresh · q quit", inner));
     const need = agents.filter((a) => a.status === "waiting" || a.status === "error").length;
-    box(`agents  ${agents.length} running${need ? ` · ${need} need you` : ""}`, focus === "agents", aBody, aH);
+    const appr = agents.reduce((n, a) => n + (a.approvals?.length ?? 0), 0);
+    box(`agents  ${agents.length} running${appr ? ` · ⚠ ${appr} awaiting approval` : ""}${need ? ` · ${need} need you` : ""}`, focus === "agents", aBody, aH);
 
     // status / prompt line
     const bottom = prompt ? `${c.fg(COL.accent, prompt.label)} ${prompt.value}${c.inv(" ")}` : flash ? c.fg(COL.waiting, ` ${flash}`) : c.dim(" fleet home");
@@ -173,6 +182,18 @@ export function runHome() {
     }
   }
 
+  async function decide(a: AgentRecord | undefined, allow: boolean) {
+    const p = a?.approvals?.[0];
+    if (!a || !p) return say("nothing waiting for approval on this agent");
+    try {
+      await request(a.socket, { op: "approve", allow, approvalId: p.id });
+      say(`${allow ? "allowed" : "blocked"} on ${a.id}: ${p.command ?? p.action}`);
+    } catch (e: any) {
+      say(`could not reach ${a.id}: ${e?.message || e}`);
+    }
+    agents = listAgents();
+  }
+
   function tryAttach(id: string) {
     try {
       attach(id);
@@ -217,8 +238,19 @@ export function runHome() {
       case "m":
         tryAttach("master");
         break;
+      case "p": {
+        const i = agents.findIndex((a) => a.approvals?.length);
+        if (i < 0) say("nothing waiting for approval");
+        else ((focus = "agents"), (sel.agents = i));
+        break;
+      }
+      case "y":
       case "n":
-        await newAgent();
+        if (focus === "agents" && agents[cur]?.approvals?.length) {
+          await decide(agents[cur], key === "y");
+          break;
+        }
+        if (key === "n") await newAgent();
         break;
       case "\r":
         if (focus === "agents") agents[cur] && tryAttach(agents[cur].id);

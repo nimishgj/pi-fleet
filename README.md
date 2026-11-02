@@ -15,11 +15,23 @@ fleet up        # session "fleet": tab "home" (todos + agents) and tab "master" 
 - **agent tabs**: pi on the left, lazygit on the right. `/fleet k9s [context]` (or `fleet k9s`) toggles a k9s pane (`k9s --headless`).
   Rex tab headers show each agent's state (working / needs you / error) via the Program Status Protocol.
 
+## Safety approvals
+
+When safety-guard asks "Allow once / Block", the agent shows `⚠ approve?` on home with the exact command
+(and its Rex tab shows blocked). On home: `p` jumps to the next one, `y` allows, `n` blocks. The prompt in the
+agent's own tab still works; whichever human answers first wins. `fleet pending` lists them;
+`fleet approve ID` / `fleet deny ID` answer from a terminal (interactive only, asks you to type yes).
+
+Only a human can approve: the master has no approve tool, the CLI refuses without a TTY, and safety-guard blocks
+agent commands that try to approve or talk to the fleet sockets. Requires the matching safety-guard change
+(it publishes `fleet:approval_request` on `pi.events` and accepts a `decide(allow)` callback).
+
 ## CLI
 
 ```
 fleet spawn [-c DIR] [-n NAME] [-w BRANCH] [--diff|--no-git] -- PROMPT
 fleet ls | attach ID | read ID [N] | ask ID QUESTION | send ID MESSAGE | k9s [CTX] | diff
+fleet pending | approve ID | deny ID
 ```
 
 `FLEET_SESSION` picks a different Rex session (label or id); default `fleet`.
