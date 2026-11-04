@@ -16,6 +16,16 @@ fleet up        # session "fleet": tab "home" (todos + agents) and tab "master" 
 - **agent tabs**: pi on the left, lazygit on the right. `/fleet k9s [context]` (or `fleet k9s`) toggles a k9s pane (`k9s --headless`).
   Rex tab headers show each agent's state (working / needs you / error) via the Program Status Protocol.
 
+## Knowledge (pi-knowledge)
+
+If [pi-knowledge](../pi-knowledge) is installed, fleet uses it without blocking agents:
+
+- An agent's starting prompt never shows the knowledge checklist. Choose knowledge when you start it instead:
+  `fleet spawn --kb id1,id2 -- PROMPT`, the home screen's start flow (prefilled with the best matches), or the master,
+  which searches the knowledge base (`kb_search`) and passes ids to `fleet_spawn`.
+- Knowledge suggestions from fleet agents are reviewed on **home**: the agents box shows `💡 N knowledge to review`;
+  press `K`, then `s` to edit and save in your editor, `x` to skip for good, `esc` for later.
+
 ## After a restart
 
 Restarting Rex or the Mac ends every pi, but nothing is lost: each agent fleet started is saved in
@@ -67,7 +77,7 @@ Safety approvals are **not** on A2A, because models can call A2A. They stay on t
 ## CLI
 
 ```
-fleet spawn [-c DIR] [-n NAME] [-w BRANCH] [--diff|--no-git] -- PROMPT
+fleet spawn [-c DIR] [-n NAME] [-w BRANCH] [--diff|--no-git] [--kb ID,…] -- PROMPT
 fleet ls | attach ID | read ID [N] | k9s [CTX] | diff
 fleet restore ID... | --all | forget ID...
 fleet ask ID QUESTION | send [-t TASK_ID] ID MESSAGE | task ID TASK_ID | tasks ID | card ID

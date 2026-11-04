@@ -608,10 +608,15 @@ export default function fleet(pi: ExtensionAPI) {
       prompt: Type.String({ description: "task for the new agent" }),
       name: Type.Optional(Type.String({ description: "short id, e.g. flaky-test" })),
       worktree: Type.Optional(Type.String({ description: "branch name; creates a sibling worktree" })),
+      kb: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "knowledge entry ids to attach to the starting prompt (find them with kb_search); the agent gets their exact text",
+        }),
+      ),
     }),
     async execute(_id, p) {
-      const r = spawn({ cwd: p.cwd, prompt: p.prompt, name: p.name, worktree: p.worktree, focus: false });
-      return ok(`Started ${r.name} in ${r.cwd} (Rex tab "${r.name}" in session fleet).`, r);
+      const r = spawn({ cwd: p.cwd, prompt: p.prompt, name: p.name, worktree: p.worktree, kb: p.kb, focus: false });
+      return ok(`Started ${r.name} in ${r.cwd} (Rex tab "${r.name}" in session fleet)${p.kb?.length ? ` with knowledge: ${p.kb.join(", ")}` : ""}.`, r);
     },
   });
 
@@ -645,7 +650,7 @@ export default function fleet(pi: ExtensionAPI) {
       `- "What is everyone doing?" → fleet_list, then fleet_read id='*', and report per agent: doing now / tried / next. Lead with agents that need the user (waiting, error).\n` +
       `- Only use fleet_ask when the user asks to check live or ask the agent directly.\n` +
       `- fleet_ask and fleet_send talk to agents over A2A. fleet_send returns a task id; use fleet_task to see how it went. An input-required task means the agent asked something back: answer with fleet_send and that taskId.\n` +
-      `- To start work, use fleet_spawn (use a worktree when another agent already works in that repo).\n` +
+      `- To start work, use fleet_spawn (use a worktree when another agent already works in that repo). If the kb_search tool exists, search the knowledge base for the task first and pass the relevant entry ids as kb; the new agent will not be asked to pick knowledge itself.\n` +
       `- To let the user talk to an agent, use fleet_attach.\n` +
       `- After a restart, agents show as stopped in fleet_list. You can still fleet_read them. Restore one with fleet_restore only when the user asks.\n` +
       `- Safety approvals (status "approval") can only be answered by the human: tell them to press y/n on that agent in the fleet home tab, or run \`fleet approve <id>\` / \`fleet deny <id>\`. You have no way to approve, and must never try to work around a safety-guard prompt.`,

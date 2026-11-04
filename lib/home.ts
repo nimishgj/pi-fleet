@@ -1,9 +1,11 @@
 // The home screen: todos on top, running agents below. Plain ANSI, no deps.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { type AgentRecord, type SavedAgent, ensureDirs, forgetAgent, listAgents, request, stoppedAgents, TODO_FILE, FLEET_DIR } from "./registry.ts";
 import { attach, restore, spawn } from "./rex.ts";
+import { loadKnowledge } from "./kb.ts";
+import { spawnSync } from "node:child_process";
 
 type Todo = { done: boolean; text: string; pi?: string };
 
@@ -68,6 +70,22 @@ export function runHome() {
   let focus: "todo" | "agents" = todos.some((t) => !t.done) ? "todo" : "agents";
   let sel = { todo: 0, agents: 0 };
   let flash = "";
+  // pi-knowledge (optional): suggestions from fleet agents are reviewed here, not in their tabs.
+  let kbLib: any;
+  let kbPending: any[] = [];
+  let kbReview: any = null; // the suggestion being reviewed
+  const refreshKb = () => {
+    try {
+      kbPending = kbLib ? kbLib.listPending().filter((s: any) => s.agent) : [];
+    } catch {
+      kbPending = [];
+    }
+  };
+  loadKnowledge().then((k) => {
+    kbLib = k;
+    refreshKb();
+    draw();
+  });
   // line-input mode
   let prompt: { label: string; value: string; done: (v: string | null) => void } | null = null;
 
@@ -165,7 +183,24 @@ export function runHome() {
     aBody[aH - 3] = c.dim(fit("  enter attach · y/n approve · p next approval · n new pi · m master · R/A/D stopped · r refresh · q quit", inner));
     const need = agents.filter((a) => a.status === "waiting" || a.status === "error").length;
     const appr = agents.reduce((n, a) => n + (a.approvals?.length ?? 0), 0);
-    box(`agents  ${agents.length} running${stopped.length ? ` · ${stopped.length} stopped` : ""}${appr ? ` · ⚠ ${appr} awaiting approval` : ""}${need ? ` · ${need} need you` : ""}`, focus === "agents", aBody, aH);
+    box(`agents  ${agents.length} running${stopped.length ? ` · ${stopped.length} stopped` : ""}${appr ? ` · ⚠ ${appr} awaiting approval` : ""}${need ? ` · ${need} need you` : ""}${kbPending.length ? ` · 💡 ${kbPending.length} knowledge to review (K)` : ""}`, focus === "agents", aBody, aH);
+
+    // Knowledge review: drawn over the bottom of the screen.
+    if (kbReview) {
+      // Fit plain text first, then colour it (fit counts characters, not escape codes).
+      const row = (text: string, style: (x: string) => string = (x) => x) => style(fit(text, inner));
+      const body = [
+        row(` ${kbReview.title}   from ${kbReview.agent}`, c.bold),
+        ...String(kbReview.body).split("\n").map((l: string) => row(`   ${l}`)),
+        ...(kbReview.reason ? [row(`   why: ${kbReview.reason}`, c.dim)] : []),
+        row(`   triggers: ${(kbReview.triggers ?? []).join(", ")}`, c.dim),
+        row(""),
+        row(" s review & save (opens your editor) · x skip, don't offer again · esc later · j next", (x) => c.fg(COL.accent, x)),
+      ];
+      const h = body.length + 2;
+      lines.splice(Math.max(0, lines.length - h), h);
+      box(`💡 save as knowledge?  ${kbPending.indexOf(kbReview) + 1}/${kbPending.length}`, true, body, h);
+    }
 
     // status / prompt line
     const bottom = prompt ? `${c.fg(COL.accent, prompt.label)} ${prompt.value}${c.inv(" ")}` : flash ? c.fg(COL.waiting, ` ${flash}`) : c.dim(" fleet home");
@@ -186,8 +221,10 @@ export function runHome() {
     if (wt === null) return;
     const name = await ask("agent name:", wt ? wt.split("/").pop()! : basename(dir.replace(/\/+$/, "")));
     if (!name) return;
+    const kb = await askKnowledge(t.text);
+    if (kb === null) return;
     try {
-      const r = spawn({ cwd: dir, prompt: t.text, worktree: wt || undefined, name, focus: false });
+      const r = spawn({ cwd: dir, prompt: t.text, worktree: wt || undefined, name, kb, focus: false });
       t.pi = r.name;
       saveTodos(todos);
       state.lastDir = dir;
@@ -198,6 +235,45 @@ export function runHome() {
     }
   }
 
+  /** Knowledge to attach to a new agent's starting prompt, prefilled with the best matches. null = cancelled. */
+  async function askKnowledge(promptText: string): Promise<string[] | null> {
+    if (!kbLib) return [];
+    let suggested: string[] = [];
+    try {
+      suggested = kbLib.rank(kbLib.currentIndex(), promptText).map((m: any) => m.entry.id);
+    } catch {}
+    const ids = kbLib.loadEntries().entries.map((e: any) => e.id);
+    if (!ids.length) return [];
+    const v = await ask(`knowledge ids, comma-separated (${ids.length} entries; enter = none):`, suggested.join(","));
+    if (v === null) return null;
+    const chosen = v.split(",").map((x) => x.trim()).filter(Boolean);
+    const unknown = chosen.filter((x) => !ids.includes(x));
+    if (unknown.length) say(`unknown knowledge ids ignored: ${unknown.join(", ")}`);
+    return chosen.filter((x) => ids.includes(x));
+  }
+
+  /** Open the draft in the user's editor, outside the home screen, then save it. */
+  function saveSuggestion(sg: any) {
+    const file = join(tmpdir(), `fleet-kb-${sg.id}.md`);
+    writeFileSync(file, kbLib.draftToText(sg));
+    const editor = process.env.VISUAL || process.env.EDITOR || "nvim";
+    out.write(`${E}?25h${E}?1049l`);
+    process.stdin.setRawMode?.(false);
+    const r = spawnSync(editor, [file], { stdio: "inherit" });
+    process.stdin.setRawMode?.(true);
+    process.stdin.resume();
+    out.write(`${E}?1049h${E}?25l${E}2J`);
+    if (r.status !== 0) return say(`editor exited with ${r.status}; not saved`);
+    try {
+      const d = kbLib.textToDraft(readFileSync(file, "utf8"));
+      const e = kbLib.saveEntry(d);
+      kbLib.resolveSuggestion(sg.id, "saved");
+      say(`knowledge saved: ${e.title}`);
+    } catch (err: any) {
+      say(`not saved: ${err?.message || err}`);
+    }
+  }
+
   async function newAgent() {
     const dir = await ask("directory:", state.lastDir);
     if (!dir) return;
@@ -205,8 +281,10 @@ export function runHome() {
     if (p === null) return;
     const name = await ask("agent name:", basename(dir.replace(/\/+$/, "")));
     if (!name) return;
+    const kb = p ? await askKnowledge(p) : [];
+    if (kb === null) return;
     try {
-      const r = spawn({ cwd: dir, prompt: p || undefined, name, focus: false });
+      const r = spawn({ cwd: dir, prompt: p || undefined, name, kb, focus: false });
       state.lastDir = dir;
       writeFileSync(STATE_FILE, JSON.stringify(state));
       say(`started ${r.name}`);
@@ -261,12 +339,32 @@ export function runHome() {
       else if (!key.startsWith("\x1b")) prompt.value += key.replace(/[\x00-\x1f]/g, "");
       return draw();
     }
+    if (kbReview) {
+      if (key === "s") saveSuggestion(kbReview);
+      else if (key === "x") (kbLib.resolveSuggestion(kbReview.id, "skipped"), say(`skipped: ${kbReview.title}`));
+      else if (key === "\x1b" || key === "q") {
+        kbReview = null;
+        return draw();
+      } else if (key !== "j" && key !== "n") return draw();
+      // next one (after save / skip / j)
+      const at = kbPending.findIndex((s) => s.id === kbReview.id);
+      refreshKb();
+      kbReview = kbPending.length ? kbPending[Math.min(Math.max(0, key === "j" || key === "n" ? at + 1 : at), kbPending.length - 1)] : null;
+      if (key === "j" && at + 1 >= kbPending.length) kbReview = kbPending[0] ?? null;
+      return draw();
+    }
     const list = focus === "todo" ? todos.length : agents.length + stopped.length;
     const cur = sel[focus];
     switch (key) {
       case "q":
       case "\x03":
         process.exit(0);
+      case "K":
+        refreshKb();
+        if (!kbLib) say("pi-knowledge is not installed");
+        else if (!kbPending.length) say("no knowledge suggestions from fleet agents");
+        else kbReview = kbPending[0];
+        break;
       case "\t":
         focus = focus === "todo" ? "agents" : "todo";
         break;
@@ -354,8 +452,9 @@ export function runHome() {
 
   out.on("resize", () => (out.write(`${E}2J`), draw()));
   setInterval(() => {
-    if (prompt) return;
+    if (prompt || kbReview) return;
     refreshAgents();
+    refreshKb();
     sel.agents = Math.min(sel.agents, Math.max(0, agents.length + stopped.length - 1));
     draw();
   }, 2000);

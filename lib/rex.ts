@@ -68,6 +68,7 @@ export type SpawnOpts = {
   server?: string;
   focus?: boolean;
   resume?: string; // pi session file to reopen instead of starting fresh
+  kb?: string[]; // pi-knowledge entry ids to attach to the starting prompt
 };
 
 export type SpawnResult = { name: string; cwd: string; session: string; window?: string; piBlock: string; gitBlock?: string };
@@ -108,7 +109,10 @@ export function spawn(o: SpawnOpts): SpawnResult {
   })();
   const git: GitPane = isRepo ? o.git ?? "lazygit" : "none";
   // FLEET_GIT lets the agent save its layout, so a restore rebuilds the same tab.
-  const env = { FLEET_NAME: name, FLEET_ROLE: "worker", FLEET_GIT: git };
+  const env: Record<string, string> = { FLEET_NAME: name, FLEET_ROLE: "worker", FLEET_GIT: git };
+  // pi-knowledge: no checklist on the starting prompt; attach what was chosen at spawn time instead.
+  if (o.prompt && !o.resume) env.FLEET_START = "1";
+  if (o.kb?.length && !o.resume) env.FLEET_KB = o.kb.join(",");
   const win = rexJson(["window", "new", "-s", session, name, "-c", cwd, ...focus, ...piCommand(env, o.prompt, o.resume)], o.server);
   const piBlock = win.block_ids[0] as string;
 

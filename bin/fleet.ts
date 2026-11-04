@@ -16,6 +16,7 @@ const USAGE = `fleet — pi agents in Rex
       -n, --name NAME               agent id / tab name
       -w, --worktree BRANCH         create a sibling git worktree on BRANCH
       --diff | --no-git             live git diff instead of lazygit, or no git pane
+      --kb ID[,ID…]                 attach pi-knowledge entries to the starting prompt
   fleet ls [--json]                 list running agents, then stopped ones that can be restored
   fleet restore ID... | --all       bring back stopped agents (same tab, dir, git pane; pi resumes its conversation)
   fleet forget ID...                remove stopped agents from the restore list
@@ -60,6 +61,7 @@ async function main(argv: string[]) {
         else if (f === "-w" || f === "--worktree") o.worktree = flags[++i];
         else if (f === "--diff") o.git = "diff";
         else if (f === "--no-git") o.git = "none";
+        else if (f === "--kb") o.kb = String(flags[++i] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
         else if (!o.prompt) o.prompt = flags.slice(i).join(" "), (i = flags.length);
       }
       const r = spawn(o);
