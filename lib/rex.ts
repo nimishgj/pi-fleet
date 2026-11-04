@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { findAgent } from "./registry.ts";
+import { type GitPane, findAgent, findSaved } from "./registry.ts";
 
 /** Session to use: FLEET_SESSION (label or id), else "fleet". Read at call time. */
 export const fleetSession = () => process.env.FLEET_SESSION || "fleet";
@@ -27,13 +27,21 @@ export function findSession(label = fleetSession(), server?: string): string | u
 }
 
 /** Run pi through an interactive zsh so the user's `pi` shell function (env, telemetry) applies. */
-// The prompt travels in FLEET_PROMPT, not as "$@": .zshrc can clobber positional
+// The prompt and session file travel in env, not as "$@": .zshrc can clobber positional
 // parameters (any bare `set foo` line does).
-export function piCommand(env: Record<string, string>, prompt?: string): string[] {
-  const all = { ...env, ...(prompt ? { FLEET_PROMPT: prompt } : {}) };
+export function piCommand(env: Record<string, string>, prompt?: string, resume?: string): string[] {
+  const all = { ...env, ...(prompt ? { FLEET_PROMPT: prompt } : {}), ...(resume ? { FLEET_RESUME: resume } : {}) };
   const envArgs = Object.entries(all).map(([k, v]) => `${k}=${v}`);
-  const script = 'p="$FLEET_PROMPT"; unset FLEET_PROMPT; if [[ -n "$p" ]]; then pi "$p"; else pi; fi';
+  const script =
+    'p="$FLEET_PROMPT"; s="$FLEET_RESUME"; unset FLEET_PROMPT FLEET_RESUME; ' +
+    'if [[ -n "$s" ]]; then pi --session "$s"; elif [[ -n "$p" ]]; then pi "$p"; else pi; fi';
   return ["--shell=none", "--", "env", ...envArgs, "zsh", "-ic", script];
+}
+
+/** The master's last conversation, if it can be reopened. */
+function masterResume(): string | undefined {
+  const s = findSaved("master");
+  return s?.role === "master" && s.sessionFile && existsSync(s.sessionFile) ? s.sessionFile : undefined;
 }
 
 /** Create the fleet session with home + master tabs, or return the existing one. */
@@ -46,7 +54,8 @@ export function up(opts: { cwd?: string; server?: string } = {}): { session: str
     opts.server,
   );
   const session = created.session_id as string;
-  rex(["window", "new", "-s", session, "master", "-c", cwd, "--focus=false", ...piCommand({ FLEET_NAME: "master", FLEET_ROLE: "master" })], opts.server);
+  // The master picks up its previous conversation, so it still knows the fleet after a restart.
+  rex(["window", "new", "-s", session, "master", "-c", cwd, "--focus=false", ...piCommand({ FLEET_NAME: "master", FLEET_ROLE: "master" }, undefined, masterResume())], opts.server);
   return { session, created: true };
 }
 
@@ -55,9 +64,10 @@ export type SpawnOpts = {
   cwd: string;
   prompt?: string;
   worktree?: string; // branch name; creates ../<repo>-<name> worktree
-  git?: "lazygit" | "diff" | "none";
+  git?: GitPane;
   server?: string;
   focus?: boolean;
+  resume?: string; // pi session file to reopen instead of starting fresh
 };
 
 export type SpawnResult = { name: string; cwd: string; session: string; window?: string; piBlock: string; gitBlock?: string };
@@ -88,11 +98,6 @@ export function spawn(o: SpawnOpts): SpawnResult {
   const session = up({ server: o.server }).session;
   const focus = o.focus === false ? ["--focus=false"] : [];
   
-  const win = rexJson(["window", "new", "-s", session, name, "-c", cwd, ...focus, ...piCommand({ FLEET_NAME: name, FLEET_ROLE: "worker" }, o.prompt)], o.server);
-  const piBlock = win.block_ids[0] as string;
-
-  let gitBlock: string | undefined;
-  const git = o.git ?? "lazygit";
   const isRepo = existsSync(join(cwd, ".git")) || (() => {
     try {
       execFileSync("git", ["-C", cwd, "rev-parse"], { stdio: "ignore" });
@@ -101,12 +106,38 @@ export function spawn(o: SpawnOpts): SpawnResult {
       return false;
     }
   })();
-  if (git !== "none" && isRepo) {
+  const git: GitPane = isRepo ? o.git ?? "lazygit" : "none";
+  // FLEET_GIT lets the agent save its layout, so a restore rebuilds the same tab.
+  const env = { FLEET_NAME: name, FLEET_ROLE: "worker", FLEET_GIT: git };
+  const win = rexJson(["window", "new", "-s", session, name, "-c", cwd, ...focus, ...piCommand(env, o.prompt, o.resume)], o.server);
+  const piBlock = win.block_ids[0] as string;
+
+  let gitBlock: string | undefined;
+  if (git !== "none") {
     const cmd = git === "lazygit" ? ["--", "lazygit"] : ["--shell=none", "--", "node", FLEET_BIN, "diff"];
     const sp = rexJson(["split", "-s", session, "-b", piBlock, "--split=right", "--ratio", "50", "--label", "git", "--focus=false", "-c", cwd, ...cmd], o.server);
     gitBlock = sp.block_ids[0];
   }
   return { name, cwd, session, window: win.window_id, piBlock, gitBlock };
+}
+
+/** Bring back a stopped agent: same tab name, directory and git pane, reopening its pi conversation. */
+export function restore(id: string, o: { server?: string; focus?: boolean } = {}): { name: string; resumed: boolean } {
+  const s = findSaved(id);
+  if (!s) throw new Error(`no saved agent named ${id}`);
+  const live = findAgent(s.id);
+  if (live && live.id === s.id) throw new Error(`${s.id} is already running`);
+  if (!existsSync(s.cwd)) throw new Error(`${s.id}: its directory is gone (${s.cwd})`);
+  const resume = s.sessionFile && existsSync(s.sessionFile) ? s.sessionFile : undefined;
+  if (s.role === "master") {
+    const r = up({ server: o.server });
+    if (!r.created) {
+      rex(["window", "new", "-s", r.session, "master", "-c", s.cwd, "--focus=false", ...piCommand({ FLEET_NAME: "master", FLEET_ROLE: "master" }, undefined, resume)], o.server);
+    }
+    return { name: "master", resumed: !!resume };
+  }
+  spawn({ name: s.id, cwd: s.cwd, git: s.git, resume, server: o.server, focus: o.focus ?? false });
+  return { name: s.id, resumed: !!resume };
 }
 
 /** Bring an agent's pane to the front: focus its block and show its session in the Rex app. */

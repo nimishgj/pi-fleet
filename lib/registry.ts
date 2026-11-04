@@ -12,6 +12,9 @@ export const AGENTS_DIR = join(COMS, "projects", PROJECT, "agents");
 export const SOCKETS_DIR = join(COMS, "sockets");
 export const FLEET_DIR = join(homedir(), ".pi", "fleet");
 export const TODO_FILE = join(FLEET_DIR, "todo.md");
+/** One file per agent that fleet started. Unlike AGENTS_DIR, these outlive the process,
+ *  so agents can be restored after Rex or the machine restarts. */
+export const SAVED_DIR = join(FLEET_DIR, "saved");
 
 export type Status = "idle" | "working" | "waiting" | "approval" | "error" | "starting";
 
@@ -27,7 +30,8 @@ export type AgentRecord = {
   repo: string;
   branch: string;
   sessionFile?: string;
-  socket: string;
+  socket: string; // Unix socket: human-only safety approvals
+  a2a?: { url: string; card: string }; // A2A v1.0 JSON-RPC endpoint and agent card (lib/a2a.ts)
   rex?: { server?: string; session?: string; block?: string };
   status: Status;
   statusMsg?: string;
@@ -39,7 +43,7 @@ export type AgentRecord = {
 };
 
 export function ensureDirs(): void {
-  for (const d of [AGENTS_DIR, SOCKETS_DIR, FLEET_DIR]) mkdirSync(d, { recursive: true });
+  for (const d of [AGENTS_DIR, SOCKETS_DIR, FLEET_DIR, SAVED_DIR]) mkdirSync(d, { recursive: true });
 }
 
 export function recordPath(id: string): string {
@@ -115,13 +119,66 @@ export function uniqueId(name: string): string {
   for (let i = 2; ; i++) if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
 }
 
-// ── socket protocol: one JSON request line, one JSON response line ─────────
+// ── saved agents: what to bring back after a restart ─────────────────────
 
-export type Request =
-  | { op: "info" }
-  | { op: "ask"; question: string; timeoutMs?: number }
-  | { op: "send"; message: string }
-  | { op: "approve"; allow: boolean; approvalId?: string };
+export type GitPane = "lazygit" | "diff" | "none";
+export type SavedAgent = {
+  id: string;
+  role: "master" | "worker";
+  cwd: string;
+  repo: string;
+  branch: string;
+  sessionFile?: string; // pi reopens this conversation on restore
+  git: GitPane;
+  task?: string;
+  lastStatus?: Status;
+  lastSeen: number;
+};
+
+const savedPath = (id: string) => join(SAVED_DIR, `${id}.json`);
+
+export function saveAgent(s: SavedAgent): void {
+  ensureDirs();
+  const p = savedPath(s.id);
+  const tmp = `${p}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(s, null, 2));
+  renameSync(tmp, p);
+}
+
+export function loadSaved(): SavedAgent[] {
+  if (!existsSync(SAVED_DIR)) return [];
+  const out: SavedAgent[] = [];
+  for (const f of readdirSync(SAVED_DIR)) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      out.push(JSON.parse(readFileSync(join(SAVED_DIR, f), "utf8")));
+    } catch {
+      /* half-written; skip */
+    }
+  }
+  return out.sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+export function findSaved(id: string): SavedAgent | undefined {
+  const all = loadSaved();
+  return all.find((s) => s.id === id) ?? all.find((s) => s.id.startsWith(id));
+}
+
+export function forgetAgent(id: string): void {
+  rmSync(savedPath(id), { force: true });
+}
+
+/** Saved agents on this machine that are not running now. */
+export function stoppedAgents(running: AgentRecord[] = listAgents()): SavedAgent[] {
+  const live = new Set(running.filter((a) => a.host === hostname()).map((a) => a.id));
+  return loadSaved().filter((s) => !live.has(s.id));
+}
+
+// ── approval socket: one JSON request line, one JSON response line ─────────
+// Agents talk to each other over A2A (lib/a2a.ts). This socket only carries the
+// human's answer to a safety-guard prompt, which must never be reachable via A2A.
+
+export type Request = { op: "info" } | { op: "approve"; allow: boolean; approvalId?: string };
 
 export function request(sock: string, req: Request, timeoutMs = 15_000): Promise<any> {
   return new Promise((resolve, reject) => {

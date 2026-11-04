@@ -2,8 +2,8 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, join } from "node:path";
-import { type AgentRecord, ensureDirs, listAgents, request, TODO_FILE, FLEET_DIR } from "./registry.ts";
-import { attach, spawn } from "./rex.ts";
+import { type AgentRecord, type SavedAgent, ensureDirs, forgetAgent, listAgents, request, stoppedAgents, TODO_FILE, FLEET_DIR } from "./registry.ts";
+import { attach, restore, spawn } from "./rex.ts";
 
 type Todo = { done: boolean; text: string; pi?: string };
 
@@ -18,6 +18,14 @@ const COL = { working: 114, waiting: 179, approval: 209, idle: 244, error: 204, 
 const GLYPH: Record<string, string> = { working: "●", waiting: "◐", approval: "⚠", idle: "○", error: "✖", starting: "◌" };
 const STATE: Record<string, string> = { working: "working", waiting: "needs you", approval: "approve?", idle: "idle", error: "error", starting: "starting" };
 const STATE_FILE = join(FLEET_DIR, "home.json");
+
+function ago(t: number): string {
+  const m = Math.round((Date.now() - t) / 60_000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  if (m < 48 * 60) return `${Math.round(m / 60)}h ago`;
+  return `${Math.round(m / 1440)}d ago`;
+}
 
 const fit = (s: string, n: number) => (n <= 0 ? "" : s.length > n ? s.slice(0, Math.max(0, n - 1)) + "…" : s + " ".repeat(n - s.length));
 
@@ -48,6 +56,14 @@ export function runHome() {
   if (!process.env.FLEET_SESSION && process.env.REX_SESSION) process.env.FLEET_SESSION = process.env.REX_SESSION;
   let todos = loadTodos();
   let agents: AgentRecord[] = listAgents();
+  let stopped: SavedAgent[] = stoppedAgents(agents);
+  const refreshAgents = () => {
+    agents = listAgents();
+    stopped = stoppedAgents(agents);
+  };
+  /** The agents list holds running agents, then stopped ones. */
+  const rowAt = (i: number): { live?: AgentRecord; gone?: SavedAgent } =>
+    i < agents.length ? { live: agents[i] } : { gone: stopped[i - agents.length] };
   let state = loadState();
   let focus: "todo" | "agents" = todos.some((t) => !t.done) ? "todo" : "agents";
   let sel = { todo: 0, agents: 0 };
@@ -107,32 +123,49 @@ export function runHome() {
     const aH = H - tH - 1;
     const cw = { id: 16, st: 11, host: 10, repo: Math.min(40, Math.max(20, Math.floor(inner * 0.3))) };
     const lastW = Math.max(10, inner - 3 - cw.id - cw.st - cw.host - cw.repo);
-    const aBody = [c.dim(fit(`   ${fit("NAME", cw.id)}${fit("STATE", cw.st)}${fit("HOST", cw.host)}${fit("REPO · BRANCH", cw.repo)}DOING`, inner))];
+    const header = c.dim(fit(`   ${fit("NAME", cw.id)}${fit("STATE", cw.st)}${fit("HOST", cw.host)}${fit("REPO · BRANCH", cw.repo)}DOING`, inner));
+    const rowsLines: string[] = [];
+    let selLine = 0;
     agents.forEach((a, i) => {
       const on = focus === "agents" && sel.agents === i;
+      if (on) selLine = rowsLines.length;
       const host = a.host === hostname() ? "local" : a.host;
       const doing = a.status === "waiting" || a.status === "error" ? a.statusMsg ?? "" : a.status === "approval" ? "" : a.lastTool ?? a.task ?? "";
       const plain = ` ${GLYPH[a.status]} ${fit(a.id, cw.id)}${fit(STATE[a.status], cw.st)}${fit(host, cw.host)}${fit(`${a.repo}:${a.branch}`, cw.repo)}${fit(doing.replace(/\s+/g, " "), lastW)}`;
       const sc = COL[a.status];
-      if (on) aBody.push(c.inv(fit(plain, inner)));
+      if (on) rowsLines.push(c.inv(fit(plain, inner)));
       else
-        aBody.push(
+        rowsLines.push(
           ` ${c.fg(sc, GLYPH[a.status])} ${a.role === "master" ? c.fg(COL.accent, fit(a.id, cw.id)) : fit(a.id, cw.id)}${c.fg(sc, fit(STATE[a.status], cw.st))}${c.fg(COL.host, fit(host, cw.host))}${fit(`${a.repo}:${a.branch}`, cw.repo)}${c.dim(fit(doing.replace(/\s+/g, " "), lastW))}`,
         );
       // Pending safety-guard approvals, one line each, under the agent.
       for (const p of a.approvals ?? []) {
         const what = `${p.severity === "destructive" ? "DESTRUCTIVE " : ""}${p.command ?? p.action}`.replace(/\s+/g, " ");
         const hint = on ? "  y allow · n block" : "";
-        aBody.push(c.fg(COL.approval, fit(`     ⚠ ${fit(what, inner - 8 - hint.length)}${hint}`, inner)));
-        if (on && p.reason) aBody.push(c.dim(fit(`       ${p.reason}`, inner)));
+        rowsLines.push(c.fg(COL.approval, fit(`     ⚠ ${fit(what, inner - 8 - hint.length)}${hint}`, inner)));
+        if (on && p.reason) rowsLines.push(c.dim(fit(`       ${p.reason}`, inner)));
       }
     });
-    if (!agents.length) aBody.push(c.dim(fit("   no pi agents running — press n to start one", inner)));
+    if (!agents.length) rowsLines.push(c.dim(fit("   no pi agents running — press n to start one", inner)));
+    if (stopped.length) {
+      rowsLines.push(c.dim(fit(`   ── stopped · enter/R restore · A restore all · D forget ${"─".repeat(inner)}`, inner)));
+      stopped.forEach((st, j) => {
+        const on = focus === "agents" && sel.agents === agents.length + j;
+        if (on) selLine = rowsLines.length;
+        const when = ago(st.lastSeen);
+        const plain = ` ◌ ${fit(st.id, cw.id)}${fit("stopped", cw.st)}${fit("local", cw.host)}${fit(`${st.repo}:${st.branch}`, cw.repo)}${fit(`${when} · ${(st.task ?? "").replace(/\s+/g, " ")}`, lastW)}`;
+        rowsLines.push(on ? c.inv(fit(plain, inner)) : c.dim(fit(plain, inner)));
+      });
+    }
+    // Scroll so the selected row stays visible.
+    const visible = Math.max(1, aH - 4);
+    const offset = Math.max(0, selLine - visible + 1);
+    const aBody = [header, ...rowsLines.slice(offset, offset + visible)];
     while (aBody.length < aH - 3) aBody.push(" ".repeat(inner));
-    aBody[aH - 3] = c.dim(fit("  enter attach · y/n approve · p next approval · n new pi · m master · r refresh · q quit", inner));
+    aBody[aH - 3] = c.dim(fit("  enter attach · y/n approve · p next approval · n new pi · m master · R/A/D stopped · r refresh · q quit", inner));
     const need = agents.filter((a) => a.status === "waiting" || a.status === "error").length;
     const appr = agents.reduce((n, a) => n + (a.approvals?.length ?? 0), 0);
-    box(`agents  ${agents.length} running${appr ? ` · ⚠ ${appr} awaiting approval` : ""}${need ? ` · ${need} need you` : ""}`, focus === "agents", aBody, aH);
+    box(`agents  ${agents.length} running${stopped.length ? ` · ${stopped.length} stopped` : ""}${appr ? ` · ⚠ ${appr} awaiting approval` : ""}${need ? ` · ${need} need you` : ""}`, focus === "agents", aBody, aH);
 
     // status / prompt line
     const bottom = prompt ? `${c.fg(COL.accent, prompt.label)} ${prompt.value}${c.inv(" ")}` : flash ? c.fg(COL.waiting, ` ${flash}`) : c.dim(" fleet home");
@@ -191,7 +224,21 @@ export function runHome() {
     } catch (e: any) {
       say(`could not reach ${a.id}: ${e?.message || e}`);
     }
-    agents = listAgents();
+    refreshAgents();
+  }
+
+  function tryRestore(ids: string[]) {
+    const done: string[] = [], bad: string[] = [];
+    for (const id of ids.sort((a, b) => (a === "master" ? -1 : b === "master" ? 1 : 0))) {
+      try {
+        restore(id);
+        done.push(id);
+      } catch (e: any) {
+        bad.push(`${id}: ${e?.message || e}`);
+      }
+    }
+    say(bad.length ? `restore failed — ${bad.join("; ")}` : `restored ${done.join(", ")}`);
+    setTimeout(() => (refreshAgents(), draw()), 1500);
   }
 
   function tryAttach(id: string) {
@@ -214,7 +261,7 @@ export function runHome() {
       else if (!key.startsWith("\x1b")) prompt.value += key.replace(/[\x00-\x1f]/g, "");
       return draw();
     }
-    const list = focus === "todo" ? todos.length : agents.length;
+    const list = focus === "todo" ? todos.length : agents.length + stopped.length;
     const cur = sel[focus];
     switch (key) {
       case "q":
@@ -233,11 +280,35 @@ export function runHome() {
         break;
       case "r":
         todos = loadTodos();
-        agents = listAgents();
+        refreshAgents();
         break;
       case "m":
-        tryAttach("master");
+        if (!agents.some((a) => a.id === "master") && stopped.some((st) => st.id === "master")) tryRestore(["master"]);
+        else tryAttach("master");
         break;
+      case "R":
+        if (focus === "agents" && rowAt(cur).gone) tryRestore([rowAt(cur).gone!.id]);
+        else say("select a stopped agent to restore");
+        break;
+      case "A":
+        if (stopped.length) tryRestore(stopped.map((st) => st.id));
+        else say("no stopped agents");
+        break;
+      case "D": {
+        const g = focus === "agents" ? rowAt(cur).gone : undefined;
+        if (!g) {
+          say("select a stopped agent to forget");
+          break;
+        }
+        const v = await ask(`forget ${g.id}? its conversation file stays on disk (y/N):`);
+        if (v?.toLowerCase() === "y") {
+          forgetAgent(g.id);
+          refreshAgents();
+          sel.agents = Math.min(sel.agents, Math.max(0, agents.length + stopped.length - 1));
+          say(`forgot ${g.id}`);
+        }
+        break;
+      }
       case "p": {
         const i = agents.findIndex((a) => a.approvals?.length);
         if (i < 0) say("nothing waiting for approval");
@@ -246,14 +317,18 @@ export function runHome() {
       }
       case "y":
       case "n":
-        if (focus === "agents" && agents[cur]?.approvals?.length) {
-          await decide(agents[cur], key === "y");
+        if (focus === "agents" && rowAt(cur).live?.approvals?.length) {
+          await decide(rowAt(cur).live, key === "y");
           break;
         }
         if (key === "n") await newAgent();
         break;
       case "\r":
-        if (focus === "agents") agents[cur] && tryAttach(agents[cur].id);
+        if (focus === "agents") {
+          const r = rowAt(cur);
+          if (r.live) tryAttach(r.live.id);
+          else if (r.gone) tryRestore([r.gone.id]);
+        }
         else if (todos[cur]?.pi && agents.some((a) => a.id === todos[cur].pi)) tryAttach(todos[cur].pi!);
         else if (todos[cur] && !todos[cur].done) await startForTodo(cur);
         break;
@@ -280,8 +355,8 @@ export function runHome() {
   out.on("resize", () => (out.write(`${E}2J`), draw()));
   setInterval(() => {
     if (prompt) return;
-    agents = listAgents();
-    sel.agents = Math.min(sel.agents, Math.max(0, agents.length - 1));
+    refreshAgents();
+    sel.agents = Math.min(sel.agents, Math.max(0, agents.length + stopped.length - 1));
     draw();
   }, 2000);
   draw();
