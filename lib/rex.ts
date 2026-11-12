@@ -63,42 +63,29 @@ export type SpawnOpts = {
   name?: string;
   cwd: string;
   prompt?: string;
-  worktree?: string; // branch name; creates ../<repo>-<name> worktree
   git?: GitPane;
   server?: string;
   focus?: boolean;
   resume?: string; // pi session file to reopen instead of starting fresh
   kb?: string[]; // pi-knowledge entry ids to attach to the starting prompt
+  session?: string; // Rex session label to open the agent in (created if missing); default: the fleet session
 };
 
-export type SpawnResult = { name: string; cwd: string; session: string; window?: string; piBlock: string; gitBlock?: string };
+/** A Rex session label: lowercase words joined by hyphens. */
+export const sessionLabel = (s: string) => s.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+
+export type SpawnResult = { name: string; cwd: string; session: string; sessionLabel: string; window?: string; piBlock: string; gitBlock?: string };
 
 export function spawn(o: SpawnOpts): SpawnResult {
-  let cwd = resolve(o.cwd.replace(/^~(?=$|\/)/, homedir()));
+  const cwd = resolve(o.cwd.replace(/^~(?=$|\/)/, homedir()));
   if (!existsSync(cwd)) throw new Error(`no such directory: ${cwd}`);
-  const name = (o.name || (o.worktree ? o.worktree.split("/").pop()! : basename(cwd))).replace(/[^A-Za-z0-9_.-]+/g, "-");
+  const name = (o.name || basename(cwd)).replace(/[^A-Za-z0-9_.-]+/g, "-");
 
-  if (o.worktree) {
-    const top = execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
-    const wt = join(dirname(top), `${basename(top)}-${name}`);
-    if (!existsSync(wt)) {
-      const hasBranch = (() => {
-        try {
-          execFileSync("git", ["-C", top, "rev-parse", "--verify", "--quiet", o.worktree!], { stdio: "ignore" });
-          return true;
-        } catch {
-          return false;
-        }
-      })();
-      const args = hasBranch ? ["worktree", "add", wt, o.worktree] : ["worktree", "add", "-b", o.worktree, wt];
-      execFileSync("git", ["-C", top, ...args], { stdio: "ignore" });
-    }
-    cwd = wt;
-  }
-
-  const session = up({ server: o.server }).session;
+  // The fleet session (home + master) always exists: approvals are answered there.
+  const fleet = up({ server: o.server }).session;
+  const label = o.session ? sessionLabel(o.session) : "";
   const focus = o.focus === false ? ["--focus=false"] : [];
-  
+
   const isRepo = existsSync(join(cwd, ".git")) || (() => {
     try {
       execFileSync("git", ["-C", cwd, "rev-parse"], { stdio: "ignore" });
@@ -113,7 +100,18 @@ export function spawn(o: SpawnOpts): SpawnResult {
   // pi-knowledge: no checklist on the starting prompt; attach what was chosen at spawn time instead.
   if (o.prompt && !o.resume) env.FLEET_START = "1";
   if (o.kb?.length && !o.resume) env.FLEET_KB = o.kb.join(",");
-  const win = rexJson(["window", "new", "-s", session, name, "-c", cwd, ...focus, ...piCommand(env, o.prompt, o.resume)], o.server);
+  if (label) env.FLEET_REX_SESSION = label; // saved, so a restore reopens it in the same session
+
+  // In a named session: a new tab when the session exists, otherwise the session itself, with this agent as its first tab.
+  let session = label ? findSession(label, o.server) : fleet;
+  let win: { window_id: string; block_ids: string[] };
+  if (session) {
+    win = rexJson(["window", "new", "-s", session, name, "-c", cwd, ...focus, ...piCommand(env, o.prompt, o.resume)], o.server);
+  } else {
+    const created = rexJson(["new", label, "-c", cwd, "--window", name, ...piCommand(env, o.prompt, o.resume)], o.server);
+    session = created.session_id as string;
+    win = created.initial_windows[0];
+  }
   const piBlock = win.block_ids[0] as string;
 
   let gitBlock: string | undefined;
@@ -122,7 +120,7 @@ export function spawn(o: SpawnOpts): SpawnResult {
     const sp = rexJson(["split", "-s", session, "-b", piBlock, "--split=right", "--ratio", "50", "--label", "git", "--focus=false", "-c", cwd, ...cmd], o.server);
     gitBlock = sp.block_ids[0];
   }
-  return { name, cwd, session, window: win.window_id, piBlock, gitBlock };
+  return { name, cwd, session: session!, sessionLabel: label || fleetSession(), window: win.window_id, piBlock, gitBlock };
 }
 
 /** Bring back a stopped agent: same tab name, directory and git pane, reopening its pi conversation. */
@@ -140,7 +138,7 @@ export function restore(id: string, o: { server?: string; focus?: boolean } = {}
     }
     return { name: "master", resumed: !!resume };
   }
-  spawn({ name: s.id, cwd: s.cwd, git: s.git, resume, server: o.server, focus: o.focus ?? false });
+  spawn({ name: s.id, cwd: s.cwd, git: s.git, resume, session: s.rexSession, server: o.server, focus: o.focus ?? false });
   return { name: s.id, resumed: !!resume };
 }
 

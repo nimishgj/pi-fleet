@@ -8,11 +8,14 @@ fleet up        # session "fleet": tab "home" (todos + agents) and tab "master" 
 
 - **home**: todos on top (`~/.pi/fleet/todo.md`), running agents below.
   `j/k` move · `tab` switch list · `enter` attach / start · `a` add · `e` edit · `x` done · `d` delete ·
-  `s` start a pi for the todo (asks dir, optional worktree branch, name) · `n` new pi · `m` master · `q` quit
+  `s` start a pi for the todo (asks dir, name) · `n` new pi · `m` master · `q` quit
 - **master**: ask "what's everyone doing?" → it reads each agent's conversation (no interruption) and
   reports doing / tried / next. Say "ask X live" to put the question to the agent itself.
-  It can also start agents (`fleet_spawn`, optionally in a new git worktree), give them work (`fleet_send`, then
+  It can also start agents (`fleet_spawn`, in the directory's existing checkout; fleet never creates git worktrees), give them work (`fleet_send`, then
   `fleet_task` to see how it went) and switch you to one (`fleet_attach`).
+  Agents the master starts never land in the fleet session: each piece of work gets its own Rex session, labelled
+  for the work (e.g. `telemetry-analyzer-deploy`), and agents on the same work share it as tabs. Without a label,
+  the agent gets a session named after itself. Home and approvals stay in `fleet`.
 - **agent tabs**: pi on the left, lazygit on the right. `/fleet k9s [context]` (or `fleet k9s`) toggles a k9s pane (`k9s --headless`).
   Rex tab headers show each agent's state (working / needs you / error) via the Program Status Protocol.
 
@@ -29,11 +32,12 @@ If [pi-knowledge](../pi-knowledge) is installed, fleet uses it without blocking 
 ## After a restart
 
 Restarting Rex or the Mac ends every pi, but nothing is lost: each agent fleet started is saved in
-`~/.pi/fleet/saved/<id>.json` (directory, git pane, pi session file, task), and those files outlive the process.
+`~/.pi/fleet/saved/<id>.json` (directory, git pane, Rex session, pi session file, task), and those files outlive the process.
 
 - `fleet up` brings back home and the master; the master reopens its previous conversation.
 - Home lists the others under **stopped**: `enter`/`R` restores one, `A` all, `D` forgets one. A restored agent gets
-  its tab back with the same name, directory and git pane, and pi resumes its conversation (`pi --session`).
+  its tab back with the same name, directory and git pane, in the same Rex session (recreated if needed), and pi
+  resumes its conversation (`pi --session`).
 - `fleet restore ID… | --all`, `fleet forget ID…`; `fleet ls` shows stopped agents too.
 - The master sees stopped agents in `fleet_list`, can `fleet_read` them, and has `fleet_restore`.
 
@@ -77,14 +81,15 @@ Safety approvals are **not** on A2A, because models can call A2A. They stay on t
 ## CLI
 
 ```
-fleet spawn [-c DIR] [-n NAME] [-w BRANCH] [--diff|--no-git] [--kb ID,…] -- PROMPT
+fleet spawn [-c DIR] [-n NAME] [--diff|--no-git] [--kb ID,…] [-s SESSION] -- PROMPT
 fleet ls | attach ID | read ID [N] | k9s [CTX] | diff
 fleet restore ID... | --all | forget ID...
 fleet ask ID QUESTION | send [-t TASK_ID] ID MESSAGE | task ID TASK_ID | tasks ID | card ID
 fleet pending | approve ID | deny ID
 ```
 
-`FLEET_SESSION` picks a different Rex session (label or id); default `fleet`.
+`FLEET_SESSION` picks a different Rex session (label or id) for home and the master; default `fleet`.
+`fleet spawn -s LABEL` opens the agent in Rex session LABEL (created if missing) instead.
 
 ## How it works
 

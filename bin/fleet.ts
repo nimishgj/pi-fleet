@@ -14,9 +14,9 @@ const USAGE = `fleet — pi agents in Rex
   fleet spawn [opts] [-- prompt]    start a pi in a new tab with lazygit beside it
       -c, --cwd DIR                 directory (default: current)
       -n, --name NAME               agent id / tab name
-      -w, --worktree BRANCH         create a sibling git worktree on BRANCH
       --diff | --no-git             live git diff instead of lazygit, or no git pane
       --kb ID[,ID…]                 attach pi-knowledge entries to the starting prompt
+      -s, --session LABEL           open it in Rex session LABEL (created if missing) instead of the fleet session
   fleet ls [--json]                 list running agents, then stopped ones that can be restored
   fleet restore ID... | --all       bring back stopped agents (same tab, dir, git pane; pi resumes its conversation)
   fleet forget ID...                remove stopped agents from the restore list
@@ -58,9 +58,10 @@ async function main(argv: string[]) {
         const f = flags[i];
         if (f === "-c" || f === "--cwd") o.cwd = flags[++i];
         else if (f === "-n" || f === "--name") o.name = flags[++i];
-        else if (f === "-w" || f === "--worktree") o.worktree = flags[++i];
         else if (f === "--diff") o.git = "diff";
         else if (f === "--no-git") o.git = "none";
+        else if (f === "-w" || f === "--worktree") throw new Error("git worktrees are not supported: agents work in the existing checkout");
+        else if (f === "--session" || f === "-s") o.session = String(flags[++i] ?? "");
         else if (f === "--kb") o.kb = String(flags[++i] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
         else if (!o.prompt) o.prompt = flags.slice(i).join(" "), (i = flags.length);
       }

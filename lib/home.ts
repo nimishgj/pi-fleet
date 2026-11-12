@@ -76,7 +76,7 @@ export function runHome() {
   let kbReview: any = null; // the suggestion being reviewed
   const refreshKb = () => {
     try {
-      kbPending = kbLib ? kbLib.listPending().filter((s: any) => s.agent) : [];
+      kbPending = kbLib ? kbLib.listPending() : []; // fleet agents' suggestions and repeats noticed in history
     } catch {
       kbPending = [];
     }
@@ -190,16 +190,17 @@ export function runHome() {
       // Fit plain text first, then colour it (fit counts characters, not escape codes).
       const row = (text: string, style: (x: string) => string = (x) => x) => style(fit(text, inner));
       const body = [
-        row(` ${kbReview.title}   from ${kbReview.agent}`, c.bold),
+        row(` ${kbReview.title}   ${kbReview.agent ? `from ${kbReview.agent}` : kbReview.source === "repeat" ? "noticed in your history" : ""}`, c.bold),
         ...String(kbReview.body).split("\n").map((l: string) => row(`   ${l}`)),
         ...(kbReview.reason ? [row(`   why: ${kbReview.reason}`, c.dim)] : []),
         row(`   triggers: ${(kbReview.triggers ?? []).join(", ")}`, c.dim),
         row(""),
-        row(" s review & save (opens your editor) · x skip, don't offer again · esc later · j next", (x) => c.fg(COL.accent, x)),
+        row(`   suggested: ${scopeText(kbReview)}`, c.dim),
+        row(" s save as knowledge · p rule for the project · g global rule (all open your editor) · x skip · esc later · j next", (x) => c.fg(COL.accent, x)),
       ];
       const h = body.length + 2;
       lines.splice(Math.max(0, lines.length - h), h);
-      box(`💡 save as knowledge?  ${kbPending.indexOf(kbReview) + 1}/${kbPending.length}`, true, body, h);
+      box(`💡 keep this?  ${kbPending.indexOf(kbReview) + 1}/${kbPending.length}`, true, body, h);
     }
 
     // status / prompt line
@@ -217,14 +218,12 @@ export function runHome() {
     if (!t) return;
     const dir = await ask("directory:", state.lastDir);
     if (!dir) return;
-    const wt = await ask("worktree branch (enter = none):", "");
-    if (wt === null) return;
-    const name = await ask("agent name:", wt ? wt.split("/").pop()! : basename(dir.replace(/\/+$/, "")));
+    const name = await ask("agent name:", basename(dir.replace(/\/+$/, "")));
     if (!name) return;
     const kb = await askKnowledge(t.text);
     if (kb === null) return;
     try {
-      const r = spawn({ cwd: dir, prompt: t.text, worktree: wt || undefined, name, kb, focus: false });
+      const r = spawn({ cwd: dir, prompt: t.text, name, kb, focus: false });
       t.pi = r.name;
       saveTodos(todos);
       state.lastDir = dir;
@@ -252,10 +251,18 @@ export function runHome() {
     return chosen.filter((x) => ids.includes(x));
   }
 
-  /** Open the draft in the user's editor, outside the home screen, then save it. */
-  function saveSuggestion(sg: any) {
-    const file = join(tmpdir(), `fleet-kb-${sg.id}.md`);
-    writeFileSync(file, kbLib.draftToText(sg));
+  /** Where a suggestion is suggested to go, in words. */
+  function scopeText(sg: any): string {
+    const cwd = sg.project ?? state.lastDir ?? process.cwd();
+    if (sg.scope === "project") return `rule for ${kbLib.scopeLabel("project", cwd)} (p)`;
+    if (sg.scope === "global") return "global rule (g)";
+    return "knowledge entry (s)";
+  }
+
+  /** Edit `text` in the user's editor outside the home screen. Returns the file's path, or null. */
+  function editInEditor(name: string, text: string): string | null {
+    const file = join(tmpdir(), name);
+    writeFileSync(file, text);
     const editor = process.env.VISUAL || process.env.EDITOR || "nvim";
     out.write(`${E}?25h${E}?1049l`);
     process.stdin.setRawMode?.(false);
@@ -263,7 +270,35 @@ export function runHome() {
     process.stdin.setRawMode?.(true);
     process.stdin.resume();
     out.write(`${E}?1049h${E}?25l${E}2J`);
-    if (r.status !== 0) return say(`editor exited with ${r.status}; not saved`);
+    if (r.status !== 0) {
+      say(`editor exited with ${r.status}; not saved`);
+      return null;
+    }
+    return file;
+  }
+
+  /** Add the suggestion as an always-on rule in the project's or the global context file. */
+  function saveRule(sg: any, scope: "project" | "global") {
+    const cwd = sg.project ?? state.lastDir ?? process.cwd();
+    const target = kbLib.ruleFile(scope, cwd);
+    const help = `# Rule for ${scope === "global" ? "every project" : kbLib.scopeLabel("project", cwd)}, added to ${target}. Lines starting with # are ignored.\n`;
+    const file = editInEditor(`fleet-kb-rule-${sg.id}.md`, help + sg.body + "\n");
+    if (!file) return;
+    const text = readFileSync(file, "utf8").split("\n").filter((l) => !l.startsWith("#")).join("\n").trim();
+    if (!text) return say("empty rule; not saved");
+    try {
+      kbLib.addRule(scope, text, cwd);
+      kbLib.resolveSuggestion(sg.id, "saved");
+      say(`rule added to ${target}`);
+    } catch (err: any) {
+      say(`not saved: ${err?.message || err}`);
+    }
+  }
+
+  /** Open the draft in the user's editor, outside the home screen, then save it. */
+  function saveSuggestion(sg: any) {
+    const file = editInEditor(`fleet-kb-${sg.id}.md`, kbLib.draftToText(sg));
+    if (!file) return;
     try {
       const d = kbLib.textToDraft(readFileSync(file, "utf8"));
       const e = kbLib.saveEntry(d);
@@ -341,6 +376,7 @@ export function runHome() {
     }
     if (kbReview) {
       if (key === "s") saveSuggestion(kbReview);
+      else if (key === "p" || key === "g") saveRule(kbReview, key === "g" ? "global" : "project");
       else if (key === "x") (kbLib.resolveSuggestion(kbReview.id, "skipped"), say(`skipped: ${kbReview.title}`));
       else if (key === "\x1b" || key === "q") {
         kbReview = null;

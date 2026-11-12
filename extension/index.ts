@@ -60,7 +60,14 @@ const MAX_TASKS = 200;
 // Identity lives in process memory, not env, so a pi started by one of this pi's
 // tools (a subprocess) never inherits and steals this id.
 const G = globalThis as any;
-G.__fleet ??= { name: process.env.FLEET_NAME, role: process.env.FLEET_ROLE, git: process.env.FLEET_GIT, id: undefined as string | undefined };
+G.__fleet ??= {
+  name: process.env.FLEET_NAME,
+  role: process.env.FLEET_ROLE,
+  git: process.env.FLEET_GIT,
+  rexSession: process.env.FLEET_REX_SESSION,
+  id: undefined as string | undefined,
+};
+delete process.env.FLEET_REX_SESSION;
 delete process.env.FLEET_NAME;
 delete process.env.FLEET_ROLE;
 delete process.env.FLEET_GIT;
@@ -133,7 +140,8 @@ export default function fleet(pi: ExtensionAPI) {
     const prev = findSaved(rec.id);
     const git = (G.__fleet.git as GitPane | undefined) ?? (prev?.id === rec.id ? prev.git : undefined) ?? (rec.role === "master" ? "none" : "lazygit");
     try {
-      saveAgent({ id: rec.id, role: rec.role, cwd: rec.cwd, repo: rec.repo, branch: rec.branch, sessionFile: rec.sessionFile, git, task: rec.task, lastStatus: rec.status, lastSeen: Date.now() });
+      const rexSession = (G.__fleet.rexSession as string | undefined) ?? (prev?.id === rec.id ? prev.rexSession : undefined);
+      saveAgent({ id: rec.id, role: rec.role, cwd: rec.cwd, repo: rec.repo, branch: rec.branch, sessionFile: rec.sessionFile, git, ...(rexSession ? { rexSession } : {}), task: rec.task, lastStatus: rec.status, lastSeen: Date.now() });
     } catch {
       /* never break the session over this */
     }
@@ -602,12 +610,19 @@ export default function fleet(pi: ExtensionAPI) {
     name: "fleet_spawn",
     label: "Fleet spawn",
     description:
-      "Start a new pi agent in its own Rex tab with lazygit beside it. Optionally create a git worktree on a branch so it does not collide with other agents in the same repo.",
+      "Start a new pi agent in its own Rex tab with lazygit beside it, inside a separate Rex session for the piece of work (created if it doesn't exist). " +
+      "The agent works in the given directory's existing checkout; git worktrees are never used.",
     parameters: Type.Object({
       cwd: Type.String({ description: "repo or directory to work in" }),
       prompt: Type.String({ description: "task for the new agent" }),
       name: Type.Optional(Type.String({ description: "short id, e.g. flaky-test" })),
-      worktree: Type.Optional(Type.String({ description: "branch name; creates a sibling worktree" })),
+      session: Type.Optional(
+        Type.String({
+          description:
+            "Rex session label for this piece of work, 2-4 lowercase words joined by hyphens (e.g. telemetry-analyzer-deploy). " +
+            "Agents working on the same thing share a session: reuse its label. Default: a new session named after the agent.",
+        }),
+      ),
       kb: Type.Optional(
         Type.Array(Type.String(), {
           description: "knowledge entry ids to attach to the starting prompt (find them with kb_search); the agent gets their exact text",
@@ -615,8 +630,10 @@ export default function fleet(pi: ExtensionAPI) {
       ),
     }),
     async execute(_id, p) {
-      const r = spawn({ cwd: p.cwd, prompt: p.prompt, name: p.name, worktree: p.worktree, kb: p.kb, focus: false });
-      return ok(`Started ${r.name} in ${r.cwd} (Rex tab "${r.name}" in session fleet)${p.kb?.length ? ` with knowledge: ${p.kb.join(", ")}` : ""}.`, r);
+      // The master never puts agents in its own session: each piece of work gets its own Rex session.
+      const session = p.session || p.name || basename(p.cwd.replace(/\/+$/, ""));
+      const r = spawn({ cwd: p.cwd, prompt: p.prompt, name: p.name, kb: p.kb, session, focus: false });
+      return ok(`Started ${r.name} in ${r.cwd} (Rex tab "${r.name}" in session ${r.sessionLabel})${p.kb?.length ? ` with knowledge: ${p.kb.join(", ")}` : ""}.`, r);
     },
   });
 
@@ -650,7 +667,7 @@ export default function fleet(pi: ExtensionAPI) {
       `- "What is everyone doing?" → fleet_list, then fleet_read id='*', and report per agent: doing now / tried / next. Lead with agents that need the user (waiting, error).\n` +
       `- Only use fleet_ask when the user asks to check live or ask the agent directly.\n` +
       `- fleet_ask and fleet_send talk to agents over A2A. fleet_send returns a task id; use fleet_task to see how it went. An input-required task means the agent asked something back: answer with fleet_send and that taskId.\n` +
-      `- To start work, use fleet_spawn (use a worktree when another agent already works in that repo). If the kb_search tool exists, search the knowledge base for the task first and pass the relevant entry ids as kb; the new agent will not be asked to pick knowledge itself.\n` +
+      `- To start work, use fleet_spawn. Never use git worktrees: agents work in the existing checkout (use a branch if isolation is needed). Each piece of work gets its own Rex session: pass session, a short label for the work, and reuse the same label for agents on the same work. If the kb_search tool exists, search the knowledge base for the task first and pass the relevant entry ids as kb; the new agent will not be asked to pick knowledge itself.\n` +
       `- To let the user talk to an agent, use fleet_attach.\n` +
       `- After a restart, agents show as stopped in fleet_list. You can still fleet_read them. Restore one with fleet_restore only when the user asks.\n` +
       `- Safety approvals (status "approval") can only be answered by the human: tell them to press y/n on that agent in the fleet home tab, or run \`fleet approve <id>\` / \`fleet deny <id>\`. You have no way to approve, and must never try to work around a safety-guard prompt.`,

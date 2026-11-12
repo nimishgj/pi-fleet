@@ -130,6 +130,7 @@ export type SavedAgent = {
   branch: string;
   sessionFile?: string; // pi reopens this conversation on restore
   git: GitPane;
+  rexSession?: string; // Rex session label it was opened in (none: the fleet session)
   task?: string;
   lastStatus?: Status;
   lastSeen: number;
